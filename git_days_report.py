@@ -2,30 +2,36 @@
 """
 Rapport de jours de commit par projet et par mois.
 
-Parcourt récursivement un dossier racine, découvre tous les dépôts git
+Parcourt récursivement une ou plusieurs racines, découvre tous les dépôts git
 (les dépôts SVN sont ignorés naturellement : on ne cherche que des ".git"),
-compte pour chaque dépôt les jours distincts avec au moins un commit d'un
-auteur donné sur une plage de mois, et écrit le résultat dans un fichier
+compte pour chaque dépôt les jours distincts avec au moins un commit d'un ou
+plusieurs auteurs sur une plage de mois, et écrit le résultat dans un fichier
 Excel (.xlsx).
+
+Les racines à scanner et la liste des adresses email à filtrer se
+configurent dans config.json (à côté de ce script) — rien en dur dans le
+code. Voir README.md.
 
 Usage:
     .venv/bin/python git_days_report.py --start 2026-06 --end 2026-09
 
     .venv/bin/python git_days_report.py --start 06/2026 --end 09/2026 \
-        --root ~/work --out rapport.xlsx --author j.soffichiti
+        --root ~/work --root ~/other-projects --out rapport.xlsx
 
 Options utiles:
-    --root        Dossier racine à scanner (défaut: ~/work)
-    --author      Motif (regex) filtrant l'auteur des commits.
-                  Par défaut : l'email git global de la machine.
-                  Passer --author "" pour ne filtrer aucun auteur.
+    --root        Racine à scanner, répétable (défaut: 'roots' dans config.json,
+                  sinon ~/work)
+    --config      Fichier de config JSON (racines + adresses email à filtrer)
+                  (défaut: config.json à côté de ce script)
+    --author      Motif (regex) filtrant l'auteur des commits, remplace le
+                  fichier de config pour ce run. Passer --author "" pour ne
+                  filtrer aucun auteur.
     --out         Chemin du fichier .xlsx en sortie
     --include-empty  Inclure aussi les projets sans aucune activité sur la période
 """
 
 import argparse
-import calendar
-import datetime as dt
+import json
 import re
 import subprocess
 import sys
@@ -115,31 +121,49 @@ def remote_url(repo: Path) -> str:
     return url
 
 
-def dedupe_repos(root: Path, repos: list[Path]) -> list[Path]:
+def repo_label(root: Path, repo: Path, multi_root: bool) -> str:
+    """Étiquette d'un dépôt : chemin relatif à sa racine, préfixé par le nom
+    de la racine seulement quand plusieurs racines sont scannées (pour éviter
+    toute ambiguïté entre deux racines qui partageraient un sous-dossier)."""
+    rel = str(repo.relative_to(root))
+    return f"{root.name}/{rel}" if multi_root else rel
+
+
+def discover_all_repos(roots: list[Path]) -> list[tuple[Path, Path]]:
+    """Retourne une liste de (racine, dépôt) pour toutes les racines données."""
+    pairs: list[tuple[Path, Path]] = []
+    for root in roots:
+        for repo in discover_git_repos(root):
+            pairs.append((root, repo))
+    return pairs
+
+
+def dedupe_repos(pairs: list[tuple[Path, Path]], multi_root: bool) -> list[tuple[Path, Path]]:
     """Certains projets ont deux clones du même remote (ex: un dossier 'svn_xxx'
-    laissé par un ancien pont git-svn, à côté du clone git actif). On ne garde
-    qu'un dépôt par remote, en préférant celui dont le chemin ne contient pas
-    'svn' — c'est le clone actif. Les dépôts sans remote (locaux/POC) sont
-    tous conservés, ils ne peuvent pas être des doublons."""
-    groups: dict[str, list[Path]] = {}
-    for repo in repos:
+    laissé par un ancien pont git-svn, à côté du clone git actif — ou le même
+    projet cloné sous deux racines différentes). On ne garde qu'un dépôt par
+    remote, en préférant celui dont le chemin ne contient pas 'svn' — c'est le
+    clone actif. Les dépôts sans remote (locaux/POC) sont tous conservés, ils
+    ne peuvent pas être des doublons."""
+    groups: dict[str, list[tuple[Path, Path]]] = {}
+    for root, repo in pairs:
         url = remote_url(repo)
         key = url if url else f"__local__:{repo}"
-        groups.setdefault(key, []).append(repo)
+        groups.setdefault(key, []).append((root, repo))
 
-    kept: list[Path] = []
+    kept: list[tuple[Path, Path]] = []
     for key, group in groups.items():
         if len(group) == 1:
             kept.append(group[0])
             continue
-        non_svn = [r for r in group if "svn" not in str(r.relative_to(root)).lower()]
-        chosen = sorted(non_svn or group, key=lambda p: str(p.relative_to(root)))[0]
-        skipped = [r for r in group if r != chosen]
-        for s in skipped:
-            print(f"  = doublon ignoré (même remote que {chosen.relative_to(root)}): {s.relative_to(root)}")
+        non_svn = [(r, p) for r, p in group if "svn" not in repo_label(r, p, multi_root).lower()]
+        chosen = sorted(non_svn or group, key=lambda rp: repo_label(rp[0], rp[1], multi_root))[0]
+        for r, p in group:
+            if (r, p) != chosen:
+                print(f"  = doublon ignoré (même remote que {repo_label(*chosen, multi_root)}): {repo_label(r, p, multi_root)}")
         kept.append(chosen)
 
-    kept.sort(key=lambda p: str(p.relative_to(root)).lower())
+    kept.sort(key=lambda rp: repo_label(rp[0], rp[1], multi_root).lower())
     return kept
 
 
@@ -150,27 +174,48 @@ def _walk_pruned(root: Path):
         yield dirpath, dirnames, filenames
 
 
-def default_author() -> str:
-    """Email git global exact de la machine — aucun élargissement à d'autres
-    adresses (pro/perso). Utiliser --author pour filtrer sur autre chose."""
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+
+
+def _load_config(config_path: Path) -> dict:
+    if not config_path.is_file():
+        return {}
     try:
-        out = subprocess.run(
-            ["git", "config", "--global", "user.email"],
-            capture_output=True, text=True, timeout=5,
-        )
-        return out.stdout.strip()
-    except Exception:
-        return ""
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        sys.exit(f"Impossible de lire {config_path} : {exc}")
+    if not isinstance(raw, dict):
+        sys.exit(f"{config_path} : le contenu doit être un objet JSON")
+    return raw
 
 
-def commit_days(repo: Path, author: str, since: str, until: str) -> set[str]:
-    """Jours distincts (YYYY-MM-DD) avec un commit de `author` dans [since, until)."""
+def load_config_authors(config_path: Path) -> list[str]:
+    """Lit la liste 'authors' (adresses email) depuis un fichier JSON.
+    Retourne [] si le fichier est absent ou la liste vide (= pas de filtre)."""
+    authors = _load_config(config_path).get("authors", [])
+    if not isinstance(authors, list):
+        sys.exit(f"{config_path} : la clé 'authors' doit être une liste d'adresses email")
+    return [a.strip() for a in authors if isinstance(a, str) and a.strip()]
+
+
+def load_config_roots(config_path: Path) -> list[str]:
+    """Lit la liste 'roots' (dossiers racines à scanner) depuis un fichier JSON.
+    Retourne [] si le fichier est absent ou la liste vide."""
+    roots = _load_config(config_path).get("roots", [])
+    if not isinstance(roots, list):
+        sys.exit(f"{config_path} : la clé 'roots' doit être une liste de chemins")
+    return [r.strip() for r in roots if isinstance(r, str) and r.strip()]
+
+
+def commit_days(repo: Path, authors: list[str], since: str, until: str) -> set[str]:
+    """Jours distincts (YYYY-MM-DD) avec un commit de l'un des `authors`
+    (OR — git combine plusieurs --author) dans [since, until)."""
     cmd = [
         "git", "-C", str(repo), "log", "--all",
         f"--since={since}", f"--until={until}",
         "--format=%ad", "--date=format:%Y-%m-%d",
     ]
-    if author:
+    for author in authors:
         cmd.insert(4, f"--author={author}")
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -183,7 +228,7 @@ def commit_days(repo: Path, author: str, since: str, until: str) -> set[str]:
     return {line for line in out.stdout.splitlines() if line}
 
 
-def build_report(root: Path, months: list[tuple[int, int]], author: str,
+def build_report(roots: list[Path], months: list[tuple[int, int]], authors: list[str],
                   include_empty: bool) -> tuple[list[str], dict[str, list[int]]]:
     since = f"{months[0][0]:04d}-{months[0][1]:02d}-01"
     last_y, last_m = months[-1]
@@ -195,15 +240,16 @@ def build_report(root: Path, months: list[tuple[int, int]], author: str,
 
     col_labels = [f"{MOIS_FR[m]} {y}" for (y, m) in months]
 
-    repos = discover_git_repos(root)
-    print(f"Dépôts git trouvés sous {root} : {len(repos)}")
-    repos = dedupe_repos(root, repos)
-    print(f"Dépôts retenus après déduplication (même remote) : {len(repos)}")
+    multi_root = len(roots) > 1
+    pairs = discover_all_repos(roots)
+    print(f"Dépôts git trouvés sous {', '.join(str(r) for r in roots)} : {len(pairs)}")
+    pairs = dedupe_repos(pairs, multi_root)
+    print(f"Dépôts retenus après déduplication (même remote) : {len(pairs)}")
 
     data: dict[str, list[int]] = {}
-    for repo in repos:
-        label = str(repo.relative_to(root))
-        days = commit_days(repo, author, since, until)
+    for root, repo in pairs:
+        label = repo_label(root, repo, multi_root)
+        days = commit_days(repo, authors, since, until)
         if not days:
             if include_empty:
                 data[label] = [0] * len(months)
@@ -272,27 +318,58 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--start", required=True, type=parse_month, help="Mois de début, ex: 2026-06 ou 06/2026")
     parser.add_argument("--end", required=True, type=parse_month, help="Mois de fin, ex: 2026-09 ou 09/2026")
-    parser.add_argument("--root", default="~/work", help="Dossier racine à scanner (défaut: ~/work)")
+    parser.add_argument("--root", action="append", default=None,
+                         help="Racine à scanner, répétable (défaut: 'roots' dans config.json, sinon ~/work)")
+    parser.add_argument("--config", default=None,
+                         help=f"Fichier de config JSON (racines + adresses email à filtrer) "
+                              f"(défaut: {DEFAULT_CONFIG_PATH.name} à côté de ce script)")
     parser.add_argument("--author", default=None,
-                         help="Motif filtrant l'auteur (regex git). Défaut: email git global. "
-                              "Passer --author \"\" pour ne filtrer aucun auteur.")
+                         help="Motif (regex git) filtrant l'auteur, remplace le fichier de config "
+                              "pour ce run. Passer --author \"\" pour ne filtrer aucun auteur.")
     parser.add_argument("--out", default=None, help="Fichier .xlsx en sortie")
     parser.add_argument("--include-empty", action="store_true",
                          help="Inclure aussi les projets sans aucune activité sur la période")
     args = parser.parse_args()
 
-    root = Path(args.root).expanduser().resolve()
-    if not root.is_dir():
-        sys.exit(f"Dossier introuvable : {root}")
+    config_path = Path(args.config).expanduser() if args.config else DEFAULT_CONFIG_PATH
+
+    if args.root:
+        raw_roots = args.root
+        roots_source = "--root"
+    else:
+        raw_roots = load_config_roots(config_path)
+        roots_source = f"{config_path.name}" if raw_roots else None
+        if not raw_roots:
+            raw_roots = ["~/work"]
+            roots_source = "défaut"
+
+    roots: list[Path] = []
+    for r in raw_roots:
+        p = Path(r).expanduser().resolve()
+        if not p.is_dir():
+            print(f"! Racine introuvable, ignorée : {p}", file=sys.stderr)
+            continue
+        roots.append(p)
+    if not roots:
+        sys.exit("Aucune racine valide à scanner.")
+    print(f"Racines scannées ({roots_source}) : {', '.join(str(r) for r in roots)}")
 
     months = month_range(args.start, args.end)
-    author = args.author if args.author is not None else default_author()
-    if author:
-        print(f"Filtre auteur : '{author}'")
-    else:
-        print("Aucun filtre auteur (tous les commits sont comptés)")
 
-    col_labels, data = build_report(root, months, author, args.include_empty)
+    if args.author is not None:
+        authors = [args.author] if args.author else []
+        print(f"Filtre auteur (--author) : {authors[0]!r}" if authors else "Aucun filtre auteur (--author \"\")")
+    else:
+        authors = load_config_authors(config_path)
+        if authors:
+            print(f"Filtre auteur ({config_path.name}) : {', '.join(authors)}")
+        else:
+            print(f"Aucun filtre auteur — {config_path} absent ou vide, tous les commits sont comptés")
+        # adresses littérales issues du config : échappées pour éviter que
+        # '.' ou '+' ne soient interprétés comme une regex par `git --author`
+        authors = [re.escape(a) for a in authors]
+
+    col_labels, data = build_report(roots, months, authors, args.include_empty)
 
     if args.out:
         out_path = Path(args.out).expanduser()
