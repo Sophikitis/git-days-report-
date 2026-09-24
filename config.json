@@ -1,0 +1,9 @@
+{
+  "roots": [
+    "~/work"
+  ],
+  "authors": [
+    "john.doe@gmail.com",
+    "jane.doe@gmail.com"
+  ]
+}
