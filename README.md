@@ -27,12 +27,8 @@ python3 -m venv .venv
 
 ```json
 {
-  "roots": [
-    "~/work"
-  ],
-  "authors": [
-    "j.soffichiti@highconnexion.com"
-  ]
+  "roots": ["~/work"],
+  "authors": ["john.doe@email.com"]
 }
 ```
 
@@ -53,15 +49,15 @@ Scanne les racines de `config.json` et écrit
 
 ### Options
 
-| Option | Défaut | Description |
-|---|---|---|
-| `--start` | *(requis)* | Mois de début — `YYYY-MM` ou `MM/YYYY` (ex: `2026-06` ou `06/2026`) |
-| `--end` | *(requis)* | Mois de fin, même format |
-| `--root` | `roots` dans config.json, sinon `~/work` | Racine à scanner. Répétable (`--root A --root B`) pour en remplacer plusieurs |
-| `--config` | `config.json` à côté du script | Fichier JSON (racines + adresses email à filtrer) |
-| `--author` | *(vide)* | Motif (regex git) qui remplace le fichier de config pour ce run. `--author ""` pour ne filtrer personne |
-| `--out` | `rapport_commits_<début>_a_<fin>.xlsx` | Chemin du fichier Excel en sortie |
-| `--include-empty` | désactivé | Inclut aussi les projets sans aucune activité sur la période |
+| Option            | Défaut                                   | Description                                                                                             |
+| ----------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `--start`         | _(requis)_                               | Mois de début — `YYYY-MM` ou `MM/YYYY` (ex: `2026-06` ou `06/2026`)                                     |
+| `--end`           | _(requis)_                               | Mois de fin, même format                                                                                |
+| `--root`          | `roots` dans config.json, sinon `~/work` | Racine à scanner. Répétable (`--root A --root B`) pour en remplacer plusieurs                           |
+| `--config`        | `config.json` à côté du script           | Fichier JSON (racines + adresses email à filtrer)                                                       |
+| `--author`        | _(vide)_                                 | Motif (regex git) qui remplace le fichier de config pour ce run. `--author ""` pour ne filtrer personne |
+| `--out`           | `rapport_commits_<début>_a_<fin>.xlsx`   | Chemin du fichier Excel en sortie                                                                       |
+| `--include-empty` | désactivé                                | Inclut aussi les projets sans aucune activité sur la période                                            |
 
 ### Exemples
 
@@ -101,6 +97,7 @@ Utiliser un fichier de config différent (ex: pour un autre collègue) :
 ## Sortie
 
 Un fichier `.xlsx` avec une feuille "Jours de commit" :
+
 - une ligne par projet (chemin relatif à sa racine — préfixé du nom de la
   racine si plusieurs racines sont scannées), triée par activité décroissante,
 - une colonne par mois de la plage demandée,
