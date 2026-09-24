@@ -84,7 +84,7 @@ Filtrer sur une adresse précise sans toucher au fichier de config :
 
 ```bash
 .venv/bin/python git_days_report.py --start 2026-06 --end 2026-09 \
-  --author j.dupont@highconnexion.com
+  --author j.dupont@email.com
 ```
 
 Utiliser un fichier de config différent (ex: pour un autre collègue) :
